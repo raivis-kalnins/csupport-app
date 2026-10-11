@@ -1,75 +1,43 @@
-# ClientWatch 1.0.0 — development verification
+# ClientWatch 1.1.0 — verification report
 
-Build date: 9 October 2026.
+Build date: 11 October 2026.
 
-## Completed checks
+## Checks completed in the build environment
 
-- PHP 8.4.24 syntax validation for all ten PHP source files.
-- Node.js syntax validation for the dashboard JavaScript, both copies of the
-  frontend tracker and the optional Node helper.
-- **35 HTTP API assertions:** unauthenticated access, owner installation key,
-  CSRF checks, safe website URLs, allowed origins, tracking keys, request size,
-  pageview retry deduplication, session/visitor counts, period-based new/returning
-  cohorts, multi-tab live presence, query stripping, error redaction and reopening,
-  error retry deduplication, HMAC validation, timestamp expiry, nonce replay
-  protection, update totals, fresh-check requests and private secret rotation.
-- **18 browser/UI/tracker harness assertions:** HTML escaping, modal and WordPress
-  panels, masked secrets, dark mode, mobile overflow, mobile settings access,
-  no uncaught dashboard JS errors, no pre-consent collection/storage, consent
-  activation, pageview delivery, simulated SPA navigation, browser-error delivery,
-  consent withdrawal and Do Not Track handling.
-- **7 WordPress API harness assertions:** signed report accepted by the HTTP
-  receiver, queue acknowledgement, fresh-check metadata, local tracker enqueue,
-  consent attributes, secret exclusion from frontend markup and admin capability.
-- **21 uptime/network harness assertions:** private, loopback, multicast and
-  reserved address rejection; public target allowance; DNS pinning settings;
-  TLS verification and redirects disabled; HTTP status classification; two-failure
-  confirmation; downtime/recovery notifications; bounded GET fallback.
-- The standalone PHP helper sent a heartbeat through the real local HTTP endpoint.
-  The Node helper sent a heartbeat and a signed error through that endpoint.
+- PHP 8.4.24 syntax validation passed for the dashboard, WordPress connector and
+  PHP integration files.
+- Node.js syntax validation passed for dashboard JavaScript, both tracker copies
+  and the Node integration helper.
+- Static package checks confirmed that the dashboard references the 1.1.0
+  connector/integration download names and that no `config.php` or SQLite
+  database is included in the release archives.
+- Upgrade review confirmed no destructive database schema change is required;
+  existing site rows, credentials, traffic records and settings remain in the
+  private SQLite database.
+- hCaptcha remains disabled by default and requires both a site key and saved
+  secret before it can be enabled.
+- Frontend analytics remains consent-gated by default. The new Immediate mode
+  is explicit and still honours Do Not Track / Global Privacy Control.
 
-## Test environment limitations — important
+## Environment limitations
 
-The environment provided PHP but not its **PDO SQLite** or **cURL** extensions.
-For API functional tests a TEST-ONLY PDO-compatible transport executed SQL against
-Python's real SQLite engine. Database query results and HTTP application behaviour
-were exercised, but the native PHP PDO SQLite extension itself was not exercised.
-That adapter is NOT included or required in the released app: production uses
-normal PHP PDO SQLite and requires the extension to be enabled.
+The build container has PHP PDO but does not have PDO SQLite or PHP cURL
+extensions enabled. Native SQLite database execution, live hCaptcha verification,
+external uptime probes and production email delivery therefore could not be run
+inside this environment. These need a staging check on the target hosting.
 
-Managed Chromium blocked URL navigation. UI/JavaScript tests rendered the actual
-HTML/CSS/JS locally in Chromium with test bindings for HTTP transport, navigation
-and visitor storage. The bindings called the actual local HTTP receiver where
-relevant. Native cross-origin browser transport, real localStorage persistence,
-CSP configurations and client cache/optimization plugins still require a normal
-browser test on your deployed HTTPS site. No browser security policy was disabled.
+A live WordPress runtime was not available in the build container. Plugin PHP
+syntax was validated, but activation, WP-Cron scheduling, premium update sources,
+object-cache detection and the first 1.1.0 report should be verified on one
+staging WordPress site before rolling the connector to every client.
 
-A live WordPress installation was unavailable. The WordPress test supplied
-WordPress API fixtures, not a genuine WordPress runtime. Real plugin activation,
-cron scheduling, premium updaters, multisite and actual fatal handling need a
-staging test before broad client rollout.
+## Recommended first deployment checks
 
-External HTTP probes and TLS sessions were not performed. The uptime checks used
-transport fixtures to test classification and cURL options. PHP mail(), real email
-delivery, production concurrency/load, host filesystem permissions and web-server
-rules were not validated on your hosting account.
-
-## Fixed during checks
-
-The small-screen table's hidden accessibility label could extend page width.
-The final CSS contains the label inside the scrollable table, and the mobile
-width check passed after that correction. Reserved/multicast network targets
-were also tightened, and backend error retry receipts were added.
-
-## First deployment verification
-
-1. Enable the correct PHP extensions and finish setup on HTTPS with private storage.
-2. Connect one staging website and grant analytics consent in a test browser.
-3. Verify a pageview, navigation, browser error and consent withdrawal.
-4. Activate the WordPress plugin on staging and send a backend report.
-5. Run dashboard cron manually, confirm a real HTTP check, then schedule it.
-6. Check a test alert through your host's actual mail transport before relying on it.
-
-The downloadable preview screenshots use **fictional sample websites and data**.
-No client websites have been connected or modified. No sample database, test
-credentials, test transport or environment configuration is shipped in the ZIPs.
+1. Back up the current dashboard folder and private `clientwatch-private` folder.
+2. Replace dashboard files while keeping the existing `config.php` unchanged.
+3. Confirm the dashboard still shows all existing websites.
+4. Update one WordPress site to ClientWatch Connector 1.1.0 and send a report.
+5. Confirm plugin totals, environment information and update status appear.
+6. Choose the correct frontend tracking mode and test a real consenting visit.
+7. If enabling hCaptcha, test sign-in in another browser before logging out of
+   the current administrator session.

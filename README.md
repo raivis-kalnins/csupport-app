@@ -1,4 +1,4 @@
-# ClientWatch 1.0.0
+# ClientWatch 1.1.0
 
 A basic, self-hosted client website maintenance dashboard. Its entry point is
 `index.php`; the `assets/` and `lib/` folders are required too. The WordPress
@@ -68,7 +68,7 @@ at your trusted proxy/web server; do not disable TLS checks in production.
 ## Add a WordPress website
 
 1. In ClientWatch add the exact homepage URL and choose **WordPress**.
-2. Install **clientwatch-connector-1.0.0.zip** using WordPress Plugins > Add New >
+2. Install **clientwatch-connector-1.1.0.zip** using WordPress Plugins > Add New >
    Upload Plugin. Activate it. Do not install the main dashboard ZIP as a plugin.
 3. Open WordPress **Settings > ClientWatch**. Copy the dashboard URL, Site ID,
    public tracking key and private backend secret from the Connect website tab.
@@ -108,7 +108,7 @@ query strings and URL fragments by default. Hash-only routes are intentionally n
 separate pages; use a custom pathname mapping and explicit pageview calls where needed.
 
 The script cannot read server errors or CMS updates. For server reporting, use
-`clientwatch-integrations-1.0.0.zip` and its README. Never put a backend secret into
+`clientwatch-integrations-1.1.0.zip` and its README. Never put a backend secret into
 browser JavaScript, public environment variables or query strings.
 
 ## Consent and visitor privacy
@@ -282,3 +282,25 @@ See TEST-REPORT.md in the complete kit. Source checks and local functional/brows
 tests are included in the development verification; real client hosting, live
 WordPress installation, real email delivery and production load need deployment
 validation. This package is not installed on any of your client websites yet.
+
+## 1.1.0 upgrade notes
+
+Version 1.1.0 keeps the existing SQLite database and website IDs. Replace the
+ClientWatch application files but keep your existing `config.php` and private
+`clientwatch-private` directory. No database migration is required.
+
+New in 1.1.0:
+
+- Optional hCaptcha protection for the administrator sign-in form.
+- WordPress connector tracking mode: **Consent required** (default) or
+  **Immediate tracking** for sites where your privacy configuration permits it.
+- Clearer frontend-tracker status so zero traffic can be distinguished from a
+  backend-only WordPress connection.
+- WordPress plugin totals, active/inactive counts, update counts, active theme,
+  database version, memory limits, object-cache status and selected PHP
+  extension/runtime information.
+- PHP and Node backend helpers now send a small technology/runtime health report.
+
+After replacing the WordPress connector, open **Settings > ClientWatch**, save
+its settings, choose the appropriate tracking mode, and click **Send report &
+refresh checks**. Existing connection values are retained by WordPress.

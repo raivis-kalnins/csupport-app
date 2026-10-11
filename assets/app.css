@@ -11,3 +11,6 @@ dialog{border:1px solid var(--line);padding:0;border-radius:15px;background:var(
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 /* Keep hidden table labels inside the table's scroll container on small screens. */
 .sites-panel,.site-table th{position:relative}.sr-only{left:0;top:0}
+
+/* ClientWatch 1.1 */
+.h-captcha{min-height:78px;overflow:hidden}.detail-stat span{display:block;color:var(--muted);font-size:9px;margin-top:5px}.wp-health-stats{grid-template-columns:repeat(4,minmax(0,1fr));margin:18px 0}.wp-health-stats .detail-stat strong{font-size:24px}@media(max-width:620px){.wp-health-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}

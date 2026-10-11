@@ -1,4 +1,4 @@
-/* ClientWatch tracker 1.0.0. No visitor storage or network traffic before consent. */
+/* ClientWatch tracker 1.1.0. No visitor storage or network traffic before consent. */
 (() => {
   'use strict';
   const script=document.currentScript;

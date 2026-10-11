@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-const CW_VERSION = '1.0.0';
+const CW_VERSION = '1.1.0';
 const CW_SESSION_IDLE = 1800;
 const CW_LIVE_WINDOW = 90;
 
@@ -135,6 +135,25 @@ function cw_rate(string $key, int $limit, int $seconds): bool {
 }
 function cw_ip_key(): string { return hash_hmac('sha256', (string)($_SERVER['REMOTE_ADDR'] ?? 'cli'),cw_setting('app_secret')); }
 function cw_https(): bool { return !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'; }
+function cw_hcaptcha_verify(string $token): bool {
+    if (cw_setting('hcaptcha_enabled','0') !== '1') return true;
+    $secret = cw_setting('hcaptcha_secret');
+    $sitekey = cw_setting('hcaptcha_sitekey');
+    if ($secret === '' || $sitekey === '' || $token === '') return false;
+    if (!function_exists('curl_init')) throw new RuntimeException('hCaptcha is enabled but PHP cURL is unavailable. Enable cURL or disable hCaptcha in ClientWatch settings.');
+    $post = http_build_query(['secret'=>$secret,'response'=>$token,'remoteip'=>(string)($_SERVER['REMOTE_ADDR'] ?? ''),'sitekey'=>$sitekey]);
+    $ch = curl_init('https://api.hcaptcha.com/siteverify');
+    curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$post,CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_CONNECTTIMEOUT=>4,CURLOPT_TIMEOUT=>8,CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded']]);
+    $raw = curl_exec($ch); $code = (int)curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+    if ($code !== 200 || !is_string($raw)) return false;
+    $json = json_decode($raw,true);
+    if (!is_array($json) || empty($json['success'])) return false;
+    $hostname = strtolower((string)($json['hostname'] ?? ''));
+    $expected = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+    $expected = preg_replace('/:\d+$/','',$expected) ?? $expected;
+    return $hostname === '' || $hostname === $expected;
+}
+
 function cw_session(): void {
     if (session_status() === PHP_SESSION_ACTIVE) return;
     session_name('clientwatch_session');
@@ -234,9 +253,20 @@ function cw_report(): never {
     if (isset($b['report']) && is_array($b['report'])) {
         $r = $b['report'];
         $clean = ['kind'=>cw_str($r['kind'] ?? $site['type'],20), 'runtime'=>cw_str($r['runtime'] ?? '',100), 'connector'=>cw_str($r['connector'] ?? '',30), 'received_at'=>time()];
+        if (isset($r['environment']) && is_array($r['environment'])) {
+            $e=$r['environment']; $clean['environment']=[];
+            foreach (['platform','architecture','sapi','server','memory_limit','upload_max','post_max','max_execution_time','database','active_theme'] as $key) {
+                if (isset($e[$key])) $clean['environment'][$key]=cw_str($e[$key],120);
+            }
+            foreach (['disk_free_mb','disk_total_mb','process_memory_mb','uptime_seconds'] as $key) if (isset($e[$key])) $clean['environment'][$key]=max(0,(int)$e[$key]);
+            if (isset($e['extensions']) && is_array($e['extensions'])) {
+                $clean['environment']['extensions']=[];
+                foreach (array_slice($e['extensions'],0,40,true) as $key=>$value) $clean['environment']['extensions'][cw_str($key,40)]=!empty($value);
+            }
+        }
         if ($site['type']==='wordpress' && isset($r['wordpress']) && is_array($r['wordpress'])) {
             $w=$r['wordpress'];
-            $clean['wordpress']=['version'=>cw_str($w['version'] ?? '',30),'php'=>cw_str($w['php'] ?? '',30),'debug'=>!empty($w['debug']),'cron_disabled'=>!empty($w['cron_disabled']),'multisite'=>!empty($w['multisite']),'admin_url'=>'','checks'=>[],'plugins'=>[],'themes'=>[],'core_update'=>cw_str($w['core_update'] ?? '',30)];
+            $clean['wordpress']=['version'=>cw_str($w['version'] ?? '',30),'php'=>cw_str($w['php'] ?? '',30),'debug'=>!empty($w['debug']),'cron_disabled'=>!empty($w['cron_disabled']),'multisite'=>!empty($w['multisite']),'object_cache'=>!empty($w['object_cache']),'memory_limit'=>cw_str($w['memory_limit'] ?? '',30),'max_memory_limit'=>cw_str($w['max_memory_limit'] ?? '',30),'database'=>cw_str($w['database'] ?? '',80),'active_theme'=>cw_str($w['active_theme'] ?? '',120),'admin_url'=>'','checks'=>[],'plugins'=>[],'themes'=>[],'core_update'=>cw_str($w['core_update'] ?? '',30)];
             $admin = cw_str($w['admin_url'] ?? '',1000);
             if (cw_origin($admin) === cw_origin($site['url'])) $clean['wordpress']['admin_url']=$admin;
             foreach (['core','plugins','themes'] as $kind) $clean['wordpress']['checks'][$kind]=max(0,min(time(),(int)($w['checks'][$kind] ?? 0)));
@@ -308,7 +338,7 @@ function cw_save_site(array $b): string {
     return $id;
 }
 function cw_settings_public(): array {
-    return ['base_url'=>cw_setting('base_url'),'alert_email'=>cw_setting('alert_email'),'mail_from'=>cw_setting('mail_from'),'email_browser'=>cw_setting('email_browser','0'),'retention'=>cw_setting('retention','90'),'cron_at'=>cw_setting('cron_at','0'),'mail_status'=>cw_setting('mail_status','Not configured'),'curl'=>extension_loaded('curl'),'version'=>CW_VERSION,'data_dir'=>cw_config()['data_dir'],'cron_file'=>dirname(__DIR__).'/cron.php','php'=>PHP_VERSION];
+    return ['base_url'=>cw_setting('base_url'),'alert_email'=>cw_setting('alert_email'),'mail_from'=>cw_setting('mail_from'),'email_browser'=>cw_setting('email_browser','0'),'retention'=>cw_setting('retention','90'),'hcaptcha_enabled'=>cw_setting('hcaptcha_enabled','0'),'hcaptcha_sitekey'=>cw_setting('hcaptcha_sitekey'),'hcaptcha_secret_saved'=>cw_setting('hcaptcha_secret')!==''?'1':'0','cron_at'=>cw_setting('cron_at','0'),'mail_status'=>cw_setting('mail_status','Not configured'),'curl'=>extension_loaded('curl'),'version'=>CW_VERSION,'data_dir'=>cw_config()['data_dir'],'cron_file'=>dirname(__DIR__).'/cron.php','php'=>PHP_VERSION];
 }
 function cw_admin_api(string $action): never {
     cw_auth();
@@ -352,11 +382,15 @@ function cw_admin_api(string $action): never {
         if (!str_starts_with($base,'https://') && empty(cw_config()['allow_http'])) cw_fail('Use HTTPS for the dashboard URL.');
         foreach (['alert_email','mail_from'] as $field) { $v=cw_str($b[$field] ?? '',200); if ($v && !filter_var($v,FILTER_VALIDATE_EMAIL)) cw_fail('Enter valid email addresses.'); }
         $retention=(int)($b['retention'] ?? 90); if (!in_array($retention,[30,60,90,180],true)) $retention=90;
+        $hcaptchaEnabled=!empty($b['hcaptcha_enabled']);
+        $hcaptchaSitekey=cw_str($b['hcaptcha_sitekey'] ?? '',120);
+        $hcaptchaSecret=cw_str($b['hcaptcha_secret'] ?? '',240);
+        if ($hcaptchaEnabled && ($hcaptchaSitekey==='' || ($hcaptchaSecret==='' && cw_setting('hcaptcha_secret')===''))) cw_fail('Enter both hCaptcha site key and secret before enabling login protection.');
         if (!empty($b['password'])) {
             if (!password_verify((string)($b['current_password'] ?? ''),cw_setting('password'))) cw_fail('Current password is incorrect.',403);
             if (strlen((string)$b['password'])<14 || strlen((string)$b['password'])>200) cw_fail('Use a password between 14 and 200 characters.');
         }
-        cw_setting_set('base_url',$base); cw_setting_set('alert_email',cw_str($b['alert_email'] ?? '',200)); cw_setting_set('mail_from',cw_str($b['mail_from'] ?? '',200)); cw_setting_set('email_browser',!empty($b['email_browser'])?'1':'0'); cw_setting_set('retention',(string)$retention);
+        cw_setting_set('base_url',$base); cw_setting_set('alert_email',cw_str($b['alert_email'] ?? '',200)); cw_setting_set('mail_from',cw_str($b['mail_from'] ?? '',200)); cw_setting_set('email_browser',!empty($b['email_browser'])?'1':'0'); cw_setting_set('retention',(string)$retention); cw_setting_set('hcaptcha_enabled',$hcaptchaEnabled?'1':'0'); cw_setting_set('hcaptcha_sitekey',$hcaptchaSitekey); if ($hcaptchaSecret!=='') cw_setting_set('hcaptcha_secret',$hcaptchaSecret);
         if (!empty($b['password'])) {
             cw_setting_set('password',password_hash($b['password'],PASSWORD_DEFAULT)); cw_setting_set('auth_version',bin2hex(random_bytes(16))); $_SESSION['auth_version']=cw_setting('auth_version'); session_regenerate_id(true);
         }

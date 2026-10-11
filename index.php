@@ -6,7 +6,7 @@ header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
 header('X-Frame-Options: DENY');
 header("Permissions-Policy: camera=(), microphone=(), geolocation=()");
-header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' https://js.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com; frame-src https://*.hcaptcha.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
 require __DIR__.'/lib/core.php';
 require __DIR__.'/lib/views.php';
 try {
@@ -48,6 +48,7 @@ try {
             }
         } elseif ($action==='login' && !$setup) {
             if (!cw_rate('login:'.cw_ip_key(),12,900)) $error='Too many sign-in attempts. Try again in 15 minutes.';
+            elseif (cw_setting('hcaptcha_enabled','0')==='1' && !cw_hcaptcha_verify((string)($_POST['h-captcha-response'] ?? ''))) $error='Please complete the hCaptcha check and try again.';
             elseif (hash_equals(cw_setting('username'),(string)($_POST['username'] ?? '')) && password_verify((string)($_POST['password'] ?? ''),cw_setting('password'))) {
                 session_regenerate_id(true); $_SESSION['admin']=true; $_SESSION['auth_version']=cw_setting('auth_version'); $_SESSION['seen']=$_SESSION['created']=time();
                 header('Location: index.php'); exit;
