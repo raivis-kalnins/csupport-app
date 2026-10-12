@@ -1,9 +1,10 @@
-/* ClientWatch tracker 1.1.0. No visitor storage or network traffic before consent. */
+/* ClientWatch tracker 1.2.2. No visitor storage or network traffic before consent. */
 (() => {
   'use strict';
-  const script=document.currentScript;
-  if(!script)return;
-  const site=script.dataset.site||'',key=script.dataset.key||'',endpoint=script.dataset.endpoint||'';
+  const script=document.currentScript||document.querySelector('script[data-clientwatch="1"],script[data-site][data-endpoint*="api=collect"]');
+  const cfg=(window.ClientWatchConfig&&typeof window.ClientWatchConfig==='object')?window.ClientWatchConfig:{};
+  const site=String(cfg.site||script?.dataset?.site||''),key=String(cfg.key||script?.dataset?.key||''),endpoint=String(cfg.endpoint||script?.dataset?.endpoint||'');
+  const consentMode=String(cfg.consent||script?.dataset?.consent||'required');
   if(!/^[a-f0-9]{16}$/.test(site)||!key||!endpoint)return;
   window.__clientWatchLoaded=window.__clientWatchLoaded||{};
   if(window.__clientWatchLoaded[site])return;
@@ -37,9 +38,18 @@
     const payload={site,key,type,visitor,session,tab,event:random(),path,visible:document.visibilityState==='visible',...extra};
     const json=JSON.stringify(payload);
     try{
-      if(navigator.sendBeacon&&navigator.sendBeacon(endpoint,new Blob([json],{type:'text/plain;charset=UTF-8'})))return;
-      fetch(endpoint,{method:'POST',mode:'cors',credentials:'omit',keepalive:true,headers:{'Content-Type':'text/plain;charset=UTF-8'},body:json}).catch(()=>{});
-    }catch(_){}
+      const opts={method:'POST',mode:'cors',credentials:'omit',keepalive:true,headers:{'Content-Type':'text/plain;charset=UTF-8'},body:json};
+      // Use fetch for ordinary events so failed collection is visible in browser diagnostics.
+      // sendBeacon is reserved for leave/pagehide where unload reliability matters more than response visibility.
+      if(type==='leave'&&navigator.sendBeacon){navigator.sendBeacon(endpoint,new Blob([json],{type:'text/plain;charset=UTF-8'}));return;}
+      fetch(endpoint,opts).then(r=>{
+        window.__clientWatchDiagnostic={at:Date.now(),ok:r.ok,status:r.status,type};
+        if(!r.ok&&window.console?.warn)console.warn('ClientWatch collection failed',r.status);
+      }).catch(err=>{
+        window.__clientWatchDiagnostic={at:Date.now(),ok:false,status:0,type,error:String(err?.message||err||'network error').slice(0,160)};
+        if(window.console?.warn)console.warn('ClientWatch collection failed',err);
+      });
+    }catch(err){window.__clientWatchDiagnostic={at:Date.now(),ok:false,status:0,type,error:String(err?.message||err||'send error').slice(0,160)};}
   }
   function page(force=false){
     if(!active||document.visibilityState!=='visible')return;
@@ -65,11 +75,13 @@
     try{localStorage.removeItem(storePrefix+'visitor');localStorage.removeItem(storePrefix+'session');}catch(_){}
   }
   function report(error,info={}){
-    if(!active||errors>=10)return;errors++;
+    if(!active||errors>=20)return;errors++;
     let file=String(info.file||'');try{file=new URL(file,location.href).pathname.split('/').pop()||'';}catch(_){}
     const message=scrub(error instanceof Error?error.message:error);
     if(!message)return;
-    send('error',{error:{message,file,line:Number(info.line)||0,path:cleanPath(location.href)}});
+    const type=scrub(info.type||(error instanceof Error?(error.name||'JavaScriptError'):'JavaScriptError')).slice(0,120);
+    const stack=scrub(info.stack||(error instanceof Error?error.stack:'')).slice(0,4000);
+    send('error',{error:{message,type,stack,severity:info.severity||'warning',file,line:Number(info.line)||0,path:cleanPath(location.href)}});
   }
   function hooks(){
     document.addEventListener('visibilitychange',()=>{
@@ -80,14 +92,14 @@
     window.addEventListener('pageshow',ev=>{if(active&&ev.persisted)page(true);});
     window.addEventListener('error',ev=>{
       if(!active)return;
-      if(ev instanceof ErrorEvent)report(ev.message,{file:ev.filename,line:ev.lineno});
+      if(ev instanceof ErrorEvent)report(ev.error||ev.message,{file:ev.filename,line:ev.lineno,type:ev.error?.name||'JavaScriptError',stack:ev.error?.stack||''});
       else if(ev.target&&ev.target!==window&&ev.target!==document){
         const target=ev.target;const source=target.src||target.href||'';
         // Ignore tracker failures: never recursively report its own transport.
-        if(source&&source!==script.src)report(`Failed to load ${target.tagName?.toLowerCase()||'resource'}`,{file:source});
+        if(source&&(!script||source!==script.src))report(`Failed to load ${target.tagName?.toLowerCase()||'resource'}`,{file:source,type:'ResourceError',severity:'warning'});
       }
     },true);
-    window.addEventListener('unhandledrejection',ev=>{report(ev.reason instanceof Error?ev.reason.message:typeof ev.reason==='string'?ev.reason:'Unhandled promise rejection');});
+    window.addEventListener('unhandledrejection',ev=>{const reason=ev.reason;report(reason instanceof Error?reason:(typeof reason==='string'?reason:'Unhandled promise rejection'),{type:reason instanceof Error?(reason.name||'UnhandledPromiseRejection'):'UnhandledPromiseRejection',stack:reason instanceof Error?(reason.stack||''):''});});
     ['pushState','replaceState'].forEach(method=>{const original=history[method];history[method]=function(...args){const result=original.apply(this,args);queueMicrotask(()=>page());return result;};});
     window.addEventListener('popstate',()=>page());
     window.addEventListener('online',()=>{if(active&&document.visibilityState==='visible')send('heartbeat');});
@@ -100,5 +112,5 @@
   };
   window.addEventListener('clientwatch:consent',ev=>window.ClientWatch.consent(ev.detail===true||ev.detail?.granted===true));
   // Automatic startup is explicitly opt-in. Default is 'required'.
-  if(window.ClientWatchConsent===true||script.dataset.consent==='granted')start();
+  if(window.ClientWatchConsent===true||consentMode==='granted')start();
 })();

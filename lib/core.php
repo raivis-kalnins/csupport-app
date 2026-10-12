@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-const CW_VERSION = '1.1.0';
+const CW_VERSION = '1.2.4';
 const CW_SESSION_IDLE = 1800;
 const CW_LIVE_WINDOW = 90;
 
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS pageviews (id INTEGER PRIMARY KEY, site_id TEXT NOT N
 CREATE INDEX IF NOT EXISTS pv_site_ts ON pageviews(site_id,ts);
 CREATE INDEX IF NOT EXISTS pv_ts ON pageviews(ts);
 CREATE TABLE IF NOT EXISTS presence (site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE, tab TEXT NOT NULL, visitor TEXT NOT NULL, path TEXT NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY(site_id,tab));
-CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY, site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE, fingerprint TEXT NOT NULL, source TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL, file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, path TEXT NOT NULL DEFAULT '', occurrences INTEGER NOT NULL DEFAULT 1, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0, UNIQUE(site_id,fingerprint));
+CREATE TABLE IF NOT EXISTS errors (id INTEGER PRIMARY KEY, site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE, fingerprint TEXT NOT NULL, source TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL, error_type TEXT NOT NULL DEFAULT '', stack TEXT NOT NULL DEFAULT '', file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, path TEXT NOT NULL DEFAULT '', occurrences INTEGER NOT NULL DEFAULT 1, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0, UNIQUE(site_id,fingerprint));
 CREATE INDEX IF NOT EXISTS errors_open ON errors(site_id,resolved_at,last_seen);
 CREATE TABLE IF NOT EXISTS checks (id INTEGER PRIMARY KEY, site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE, ts INTEGER NOT NULL, status TEXT NOT NULL, code INTEGER NOT NULL, ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS checks_site_ts ON checks(site_id,ts);
@@ -59,6 +59,20 @@ CREATE TABLE IF NOT EXISTS error_receipts (site_id TEXT NOT NULL REFERENCES site
 CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY, site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE, message TEXT NOT NULL, ts INTEGER NOT NULL, sent INTEGER NOT NULL DEFAULT 0);
 SQL);
+    // Lightweight schema migrations for upgrades from earlier ClientWatch releases.
+    $columns = [];
+    foreach ($db->query('PRAGMA table_info(sites)')->fetchAll() as $column) $columns[(string)$column['name']] = true;
+    if (!isset($columns['seo_report'])) $db->exec("ALTER TABLE sites ADD COLUMN seo_report TEXT NOT NULL DEFAULT '{}'");
+    if (!isset($columns['seo_checked_at'])) $db->exec("ALTER TABLE sites ADD COLUMN seo_checked_at INTEGER NOT NULL DEFAULT 0");
+    if (!isset($columns['collect_last_error'])) $db->exec("ALTER TABLE sites ADD COLUMN collect_last_error TEXT NOT NULL DEFAULT ''");
+    if (!isset($columns['collect_error_at'])) $db->exec("ALTER TABLE sites ADD COLUMN collect_error_at INTEGER NOT NULL DEFAULT 0");
+    if (!isset($columns['collect_last_origin'])) $db->exec("ALTER TABLE sites ADD COLUMN collect_last_origin TEXT NOT NULL DEFAULT ''");
+    if (!isset($columns['collect_attempt_at'])) $db->exec("ALTER TABLE sites ADD COLUMN collect_attempt_at INTEGER NOT NULL DEFAULT 0");
+    if (!isset($columns['collect_last_status'])) $db->exec("ALTER TABLE sites ADD COLUMN collect_last_status TEXT NOT NULL DEFAULT ''");
+    $errorColumns = [];
+    foreach ($db->query('PRAGMA table_info(errors)')->fetchAll() as $column) $errorColumns[(string)$column['name']] = true;
+    if (!isset($errorColumns['error_type'])) $db->exec("ALTER TABLE errors ADD COLUMN error_type TEXT NOT NULL DEFAULT ''");
+    if (!isset($errorColumns['stack'])) $db->exec("ALTER TABLE errors ADD COLUMN stack TEXT NOT NULL DEFAULT ''");
     if (cw_setting('app_secret') === '') cw_setting_set('app_secret', bin2hex(random_bytes(32)));
     return $db;
 }
@@ -114,6 +128,32 @@ function cw_origin(string $url): string {
     if (!$p || empty($p['host']) || !in_array(strtolower($p['scheme'] ?? ''), ['https','http'],true) || isset($p['user']) || isset($p['pass'])) return '';
     $scheme = strtolower($p['scheme']); $port = (int)($p['port'] ?? ($scheme === 'https' ? 443 : 80));
     return $scheme.'://'.strtolower($p['host']).(($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80) ? '' : ':'.$port);
+}
+
+function cw_origin_host_key(string $origin): string {
+    $host=strtolower((string)(parse_url($origin,PHP_URL_HOST) ?: ''));
+    return preg_replace('/^www\./','',$host) ?: $host;
+}
+function cw_origin_allowed_for_site(array $site, string $origin): bool {
+    if ($origin==='') return false;
+    $origins=json_decode((string)($site['origins'] ?? '[]'),true) ?: [];
+    if (in_array($origin,$origins,true)) return true;
+    $siteOrigin=cw_origin((string)($site['url'] ?? ''));
+    $siteScheme=strtolower((string)(parse_url($siteOrigin,PHP_URL_SCHEME) ?: ''));
+    $originScheme=strtolower((string)(parse_url($origin,PHP_URL_SCHEME) ?: ''));
+    if ($siteScheme!==$originScheme || !in_array($siteScheme,['http','https'],true)) return false;
+    $sitePort=(int)(parse_url($siteOrigin,PHP_URL_PORT) ?: ($siteScheme==='https'?443:80));
+    $originPort=(int)(parse_url($origin,PHP_URL_PORT) ?: ($originScheme==='https'?443:80));
+    if ($sitePort!==$originPort) return false;
+    return cw_origin_host_key($siteOrigin)!=='' && hash_equals(cw_origin_host_key($siteOrigin),cw_origin_host_key($origin));
+}
+function cw_remember_origin(array $site, string $origin): void {
+    if ($origin==='') return;
+    $origins=json_decode((string)($site['origins'] ?? '[]'),true) ?: [];
+    if (!in_array($origin,$origins,true)) {
+        $origins[]=$origin;
+        cw_q('UPDATE sites SET origins=? WHERE id=?',[json_encode(array_values(array_unique($origins))),$site['id']]);
+    }
 }
 function cw_url(mixed $value): string {
     $v = rtrim(cw_str($value, 1000), '/');
@@ -185,21 +225,29 @@ function cw_error(array $site, array $e, string $source): void {
     $file = explode('?', $file)[0];
     $line = max(0,min(10000000,(int)($e['line'] ?? 0)));
     $path = cw_path($e['path'] ?? '/');
-    $severity = $source === 'browser' ? 'warning' : (in_array($e['severity'] ?? '', ['critical','error','warning'],true) ? $e['severity'] : 'error');
-    $fp = hash('sha256',implode('|',[$source,$message,$file,(string)$line,$path]));
+    $type = cw_redact($e['type'] ?? '',120);
+    $stack = cw_redact($e['stack'] ?? '',4000);
+    $severity = $source === 'browser' ? (in_array($e['severity'] ?? '', ['critical','error','warning'],true) ? $e['severity'] : 'warning') : (in_array($e['severity'] ?? '', ['critical','error','warning'],true) ? $e['severity'] : 'error');
+    $fp = hash('sha256',implode('|',[$source,$type,$message,$file,(string)$line,$path]));
     $old = cw_q('SELECT id,resolved_at FROM errors WHERE site_id=? AND fingerprint=?',[$site['id'],$fp])->fetch();
     if (!$old && (int)cw_q('SELECT COUNT(*) FROM errors WHERE site_id=?',[$site['id']])->fetchColumn() >= 3000) return;
-    cw_q('INSERT INTO errors(site_id,fingerprint,source,severity,message,file,line,path,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(site_id,fingerprint) DO UPDATE SET occurrences=occurrences+1,last_seen=excluded.last_seen,resolved_at=0',[$site['id'],$fp,$source,$severity,$message,$file,$line,$path,time(),time()]);
+    cw_q("INSERT INTO errors(site_id,fingerprint,source,severity,message,error_type,stack,file,line,path,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(site_id,fingerprint) DO UPDATE SET occurrences=occurrences+1,last_seen=excluded.last_seen,resolved_at=0,stack=CASE WHEN excluded.stack<>'' THEN excluded.stack ELSE stack END,error_type=CASE WHEN excluded.error_type<>'' THEN excluded.error_type ELSE error_type END",[$site['id'],$fp,$source,$severity,$message,$type,$stack,$file,$line,$path,time(),time()]);
     if ((!$old || (int)$old['resolved_at']>0) && ($source !== 'browser' || cw_setting('email_browser','0') === '1')) cw_notify($site['id'],ucfirst($source).' '.$severity.': '.$message);
 }
 function cw_notify(string $id, string $message): void {
     if (cw_setting('alert_email') !== '') cw_q('INSERT INTO notifications(site_id,message,ts) VALUES(?,?,?)',[$id,cw_redact($message,1000),time()]);
 }
+function cw_collect_note(string $siteId, string $status, string $message='', string $origin=''): void {
+    cw_q('UPDATE sites SET collect_attempt_at=?,collect_last_status=?,collect_last_error=?,collect_error_at=?,collect_last_origin=CASE WHEN ?<>\'\' THEN ? ELSE collect_last_origin END WHERE id=?',[
+        time(),cw_str($status,40),cw_redact($message,240),$message!==''?time():0,cw_str($origin,500),cw_str($origin,500),$siteId
+    ]);
+}
 function cw_collect(): never {
     if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
         $origin = cw_origin($_SERVER['HTTP_ORIGIN'] ?? '');
-        foreach (cw_q('SELECT origins FROM sites')->fetchAll() as $s) {
-            if ($origin && in_array($origin,json_decode($s['origins'],true) ?: [],true)) {
+        foreach (cw_q('SELECT origins,url FROM sites')->fetchAll() as $s) {
+            $probe=['origins'=>$s['origins'],'url'=>$s['url']];
+            if ($origin && cw_origin_allowed_for_site($probe,$origin)) {
                 header('Access-Control-Allow-Origin: '.$origin); header('Vary: Origin');
                 header('Access-Control-Allow-Methods: POST, OPTIONS'); header('Access-Control-Allow-Headers: Content-Type'); header('Access-Control-Max-Age: 600');
                 http_response_code(204); exit;
@@ -210,20 +258,29 @@ function cw_collect(): never {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') cw_fail('POST required.',405);
     $b = cw_body(12288); $site = cw_site(cw_str($b['site'] ?? '',32));
     $origin = cw_origin($_SERVER['HTTP_ORIGIN'] ?? '');
-    if (!$origin || !in_array($origin,json_decode($site['origins'],true) ?: [],true)) cw_fail('Origin not allowed.',403);
-    header('Access-Control-Allow-Origin: '.$origin); header('Vary: Origin');
-    if (!hash_equals($site['public_key'],cw_str($b['key'] ?? '',100))) cw_fail('Invalid tracking key.',403);
-    $type = $b['type'] ?? '';
-    if (!in_array($type,['pageview','heartbeat','leave','error'],true)) cw_fail('Unknown event.');
-    foreach (['visitor','session','tab','event'] as $field) {
-        if (!preg_match('/^[a-zA-Z0-9_-]{12,80}$/',(string)($b[$field] ?? ''))) cw_fail('Invalid event identifiers.');
+    cw_collect_note($site['id'],'received','',$origin);
+    $key=cw_str($b['key'] ?? '',100);
+    if (!hash_equals($site['public_key'],$key)) {
+        cw_collect_note($site['id'],'key_rejected','Invalid public tracking key.',$origin);
+        cw_fail('Invalid tracking key.',403);
     }
-    if (!cw_rate('collect-site:'.$site['id'],6000,60) || !cw_rate('collect-ip:'.cw_ip_key().':'.$site['id'],600,60)) cw_fail('Collection rate limit reached.',429);
+    if (!cw_origin_allowed_for_site($site,$origin)) {
+        cw_collect_note($site['id'],'origin_rejected','Origin not allowed.',$origin);
+        cw_fail('Origin not allowed.',403);
+    }
+    cw_remember_origin($site,$origin);
+    header('Access-Control-Allow-Origin: '.$origin); header('Vary: Origin');
+    $type = $b['type'] ?? '';
+    if (!in_array($type,['pageview','heartbeat','leave','error'],true)) { cw_collect_note($site['id'],'payload_rejected','Unknown event type.',$origin); cw_fail('Unknown event.'); }
+    foreach (['visitor','session','tab','event'] as $field) {
+        if (!preg_match('/^[a-zA-Z0-9_-]{12,80}$/',(string)($b[$field] ?? ''))) { cw_collect_note($site['id'],'payload_rejected','Invalid event identifiers.',$origin); cw_fail('Invalid event identifiers.'); }
+    }
+    if (!cw_rate('collect-site:'.$site['id'],6000,60) || !cw_rate('collect-ip:'.cw_ip_key().':'.$site['id'],600,60)) { cw_collect_note($site['id'],'rate_limited','Collection rate limit reached.',$origin); cw_fail('Collection rate limit reached.',429); }
     $hash = fn(string $s): string => hash_hmac('sha256',$s,cw_setting('app_secret').$site['id']);
     $v = $hash($b['visitor']); $sid = $hash($b['session']); $tab = $hash($b['tab']); $now=time();
-    if (!cw_rate('visitor:'.$site['id'].':'.$v,100,60)) cw_fail('Visitor rate limit reached.',429);
+    if (!cw_rate('visitor:'.$site['id'].':'.$v,100,60)) { cw_collect_note($site['id'],'rate_limited','Visitor rate limit reached.',$origin); cw_fail('Visitor rate limit reached.',429); }
     $path = cw_path($b['path'] ?? '/');
-    if ($type === 'leave') { cw_q('DELETE FROM presence WHERE site_id=? AND tab=?',[$site['id'],$tab]); cw_json(['ok'=>true]); }
+    if ($type === 'leave') { cw_q('DELETE FROM presence WHERE site_id=? AND tab=?',[$site['id'],$tab]); cw_collect_note($site['id'],'accepted','',$origin); cw_json(['ok'=>true]); }
     $db = cw_db(); $db->beginTransaction();
     try {
         cw_q('INSERT INTO visitors(site_id,visitor,first_seen,last_seen) VALUES(?,?,?,?) ON CONFLICT(site_id,visitor) DO UPDATE SET last_seen=excluded.last_seen',[$site['id'],$v,$now,$now]);
@@ -234,9 +291,9 @@ function cw_collect(): never {
             $device = in_array($b['device'] ?? '',['desktop','mobile','tablet'],true) ? $b['device'] : 'desktop';
             cw_q('INSERT OR IGNORE INTO pageviews(site_id,event_id,session,visitor,path,referrer,device,ts) VALUES(?,?,?,?,?,?,?,?)',[$site['id'],$b['event'],$sid,$v,$path,$ref,$device,$now]);
         } elseif ($type==='error' && is_array($b['error'] ?? null)) { cw_error($site,array_merge($b['error'],['id'=>$b['event']]),'browser'); }
-        cw_q('UPDATE sites SET frontend_at=? WHERE id=?',[$now,$site['id']]);
+        cw_q('UPDATE sites SET frontend_at=?,collect_attempt_at=?,collect_last_status=?,collect_last_error=?,collect_error_at=0,collect_last_origin=? WHERE id=?',[$now,$now,'accepted','',cw_str($origin,500),$site['id']]);
         $db->commit();
-    } catch (Throwable $e) { if ($db->inTransaction()) $db->rollBack(); throw $e; }
+    } catch (Throwable $e) { if ($db->inTransaction()) $db->rollBack(); cw_collect_note($site['id'],'server_error','Collector storage error.',$origin); throw $e; }
     cw_json(['ok'=>true]);
 }
 function cw_report(): never {
@@ -266,13 +323,58 @@ function cw_report(): never {
         }
         if ($site['type']==='wordpress' && isset($r['wordpress']) && is_array($r['wordpress'])) {
             $w=$r['wordpress'];
-            $clean['wordpress']=['version'=>cw_str($w['version'] ?? '',30),'php'=>cw_str($w['php'] ?? '',30),'debug'=>!empty($w['debug']),'cron_disabled'=>!empty($w['cron_disabled']),'multisite'=>!empty($w['multisite']),'object_cache'=>!empty($w['object_cache']),'memory_limit'=>cw_str($w['memory_limit'] ?? '',30),'max_memory_limit'=>cw_str($w['max_memory_limit'] ?? '',30),'database'=>cw_str($w['database'] ?? '',80),'active_theme'=>cw_str($w['active_theme'] ?? '',120),'admin_url'=>'','checks'=>[],'plugins'=>[],'themes'=>[],'core_update'=>cw_str($w['core_update'] ?? '',30)];
+            $clean['wordpress']=['version'=>cw_str($w['version'] ?? '',30),'php'=>cw_str($w['php'] ?? '',30),'debug'=>!empty($w['debug']),'cron_disabled'=>!empty($w['cron_disabled']),'multisite'=>!empty($w['multisite']),'object_cache'=>!empty($w['object_cache']),'memory_limit'=>cw_str($w['memory_limit'] ?? '',30),'max_memory_limit'=>cw_str($w['max_memory_limit'] ?? '',30),'database'=>cw_str($w['database'] ?? '',80),'active_theme'=>cw_str($w['active_theme'] ?? '',120),'home_url'=>'','admin_url'=>'','checks'=>[],'plugins'=>[],'themes'=>[],'core_update'=>cw_str($w['core_update'] ?? '',30)];
+            $home = cw_str($w['home_url'] ?? '',1000);
+            $homeOrigin=cw_origin($home);$siteOrigin=cw_origin($site['url']);
+            if ($homeOrigin) {
+                $hh=strtolower((string)parse_url($homeOrigin,PHP_URL_HOST));$sh=strtolower((string)parse_url($siteOrigin,PHP_URL_HOST));
+                if (preg_replace('/^www\./','',$hh)===preg_replace('/^www\./','',$sh)) {
+                    $clean['wordpress']['home_url']=$home;
+                    $origins=json_decode($site['origins'],true) ?: [];
+                    if (!in_array($homeOrigin,$origins,true)) { $origins[]=$homeOrigin; cw_q('UPDATE sites SET origins=? WHERE id=?',[json_encode(array_values(array_unique($origins))),$site['id']]); }
+                }
+            }
             $admin = cw_str($w['admin_url'] ?? '',1000);
             if (cw_origin($admin) === cw_origin($site['url'])) $clean['wordpress']['admin_url']=$admin;
             foreach (['core','plugins','themes'] as $kind) $clean['wordpress']['checks'][$kind]=max(0,min(time(),(int)($w['checks'][$kind] ?? 0)));
             foreach (['plugins','themes'] as $kind) foreach (array_slice(is_array($w[$kind] ?? null)?$w[$kind]:[],0,500) as $item) {
                 if (!is_array($item)) continue;
                 $clean['wordpress'][$kind][]=['name'=>cw_str($item['name'] ?? '',180),'version'=>cw_str($item['version'] ?? '',40),'new_version'=>cw_str($item['new_version'] ?? '',40),'active'=>!empty($item['active'])];
+            }
+        }
+        if (isset($r['analytics']) && is_array($r['analytics'])) {
+            $a=$r['analytics'];
+            $clean['analytics']=[
+                'enabled'=>!empty($a['enabled']),
+                'mode'=>in_array(($a['mode'] ?? ''),['required','immediate','off'],true)?$a['mode']:'required',
+                'logged_in'=>!empty($a['logged_in'])
+            ];
+        }
+        if ($site['type']==='wordpress' && isset($r['google_marketing']) && is_array($r['google_marketing'])) {
+            $g=$r['google_marketing'];$clean['google_marketing']=['connected'=>!empty($g['connected']),'provider'=>cw_str($g['provider'] ?? '',80),'error'=>cw_str($g['error'] ?? '',180),'checked_at'=>max(0,(int)($g['checked_at'] ?? 0)),'overview'=>[],'trend'=>[],'sources'=>[]];
+            foreach(array_slice(is_array($g['overview'] ?? null)?$g['overview']:[],0,20,true) as $key=>$value)if(is_array($value))$clean['google_marketing']['overview'][cw_str($key,40)]=['value'=>(float)($value['value'] ?? 0),'previous_value'=>(float)($value['previous_value'] ?? 0),'delta_percent'=>(float)($value['delta_percent'] ?? 0)];
+            foreach(array_slice(is_array($g['trend'] ?? null)?$g['trend']:[],0,35) as $row)if(is_array($row))$clean['google_marketing']['trend'][]=['date'=>cw_str($row['date'] ?? '',30),'users'=>(float)($row['users'] ?? 0),'sessions'=>(float)($row['sessions'] ?? 0),'pageviews'=>(float)($row['pageviews'] ?? 0)];
+            foreach(array_slice(is_array($g['sources'] ?? null)?$g['sources']:[],0,10) as $row)if(is_array($row))$clean['google_marketing']['sources'][]=['source'=>cw_str($row['source'] ?? '',120),'medium'=>cw_str($row['medium'] ?? '',80),'sessions'=>(float)($row['sessions'] ?? 0),'users'=>(float)($row['users'] ?? 0)];
+        }
+        if ($site['type']==='wordpress' && isset($r['woocommerce']) && is_array($r['woocommerce'])) {
+            $woo=$r['woocommerce'];
+            $clean['woocommerce']=[
+                'active'=>!empty($woo['active']),
+                'version'=>cw_str($woo['version'] ?? '',30),
+                'currency'=>cw_str($woo['currency'] ?? '',12),
+                'orders_7'=>max(0,(int)($woo['orders_7'] ?? 0)),
+                'revenue_7'=>(float)($woo['revenue_7'] ?? 0),
+                'orders_30'=>max(0,(int)($woo['orders_30'] ?? 0)),
+                'revenue_30'=>(float)($woo['revenue_30'] ?? 0),
+                'products'=>max(0,(int)($woo['products'] ?? 0)),
+                'low_stock'=>max(0,(int)($woo['low_stock'] ?? 0)),
+                'daily'=>[]
+            ];
+            foreach (array_slice(is_array($woo['daily'] ?? null)?$woo['daily']:[],0,31) as $row) {
+                if (!is_array($row)) continue;
+                $day=cw_str($row['day'] ?? '',10);
+                if (!preg_match('/^\d{4}-\d{2}-\d{2}$/',$day)) continue;
+                $clean['woocommerce']['daily'][]=['day'=>$day,'orders'=>max(0,(int)($row['orders'] ?? 0)),'revenue'=>(float)($row['revenue'] ?? 0)];
             }
         }
         cw_q('UPDATE sites SET report=?,backend_at=?,refresh_requested=CASE WHEN ?=1 THEN 0 ELSE refresh_requested END WHERE id=?',[json_encode($clean,JSON_INVALID_UTF8_SUBSTITUTE),time(),!empty($b['fresh'])?1:0,$site['id']]);
@@ -291,8 +393,21 @@ function cw_metrics(string $id, int $since): array {
 function cw_site_public(array $s, int $since): array {
     unset($s['secret'],$s['public_key']);
     $s['report']=json_decode($s['report'],true) ?: [];
+    $s['seo_report']=json_decode((string)($s['seo_report'] ?? '{}'),true) ?: [];
     $s['origins']=json_decode($s['origins'],true) ?: [];
     $s['metrics']=cw_metrics($s['id'],$since);
+    $tech=is_array($s['seo_report']['technology'] ?? null)?$s['seo_report']['technology']:[];
+    $effective=$s['type'];
+    // Dashboard-only correction: if a site was configured as WordPress but has never sent a WordPress report,
+    // a strong non-WordPress runtime/framework signal can suppress WordPress-only UI without changing secrets or client code.
+    if ($effective==='wordpress' && (int)$s['backend_at']===0 && empty($tech['wordpress'])) {
+        if (!empty($tech['php'])) $effective='php';
+        elseif (!empty($tech['react'])) $effective='javascript';
+    }
+    // A genuine WordPress backend report is authoritative even when public WP signatures are hidden.
+    if (is_array($s['report']['wordpress'] ?? null)) $effective='wordpress';
+    $s['effective_type']=$effective;
+    $s['technology_label']=cw_str($tech['label'] ?? '',80);
     $w=$s['report']['wordpress'] ?? null; $count=0; $known=false;
     if (is_array($w)) {
         $known = !empty($w['checks']['core']) && !empty($w['checks']['plugins']) && !empty($w['checks']['themes']);
@@ -317,7 +432,8 @@ function cw_save_site(array $b): string {
     $name=cw_str($b['name'] ?? '',150); if ($name==='') throw new InvalidArgumentException('Website name is required.');
     $url=cw_url($b['url'] ?? ''); $type=$b['type'] ?? 'other';
     if (!in_array($type,['wordpress','php','javascript','other'],true)) $type='other';
-    $origins=[cw_origin($url)];
+    $primaryOrigin=cw_origin($url);$origins=[$primaryOrigin];
+    $parts=parse_url($primaryOrigin);$host=strtolower((string)($parts['host'] ?? ''));if($host&&filter_var($host,FILTER_VALIDATE_IP)===false){$altHost=str_starts_with($host,'www.')?substr($host,4):'www.'.$host;$scheme=(string)($parts['scheme'] ?? 'https');$port=isset($parts['port'])?':'.(int)$parts['port']:'';$origins[]=$scheme.'://'.$altHost.$port;}
     $extra=$b['origins'] ?? ''; if (is_array($extra)) $extra=implode("\n",$extra);
     foreach (preg_split('/[\s,]+/',cw_str($extra,2000)) ?: [] as $origin) {
         if ($origin==='') continue; $o=cw_origin($origin);
@@ -338,7 +454,7 @@ function cw_save_site(array $b): string {
     return $id;
 }
 function cw_settings_public(): array {
-    return ['base_url'=>cw_setting('base_url'),'alert_email'=>cw_setting('alert_email'),'mail_from'=>cw_setting('mail_from'),'email_browser'=>cw_setting('email_browser','0'),'retention'=>cw_setting('retention','90'),'hcaptcha_enabled'=>cw_setting('hcaptcha_enabled','0'),'hcaptcha_sitekey'=>cw_setting('hcaptcha_sitekey'),'hcaptcha_secret_saved'=>cw_setting('hcaptcha_secret')!==''?'1':'0','cron_at'=>cw_setting('cron_at','0'),'mail_status'=>cw_setting('mail_status','Not configured'),'curl'=>extension_loaded('curl'),'version'=>CW_VERSION,'data_dir'=>cw_config()['data_dir'],'cron_file'=>dirname(__DIR__).'/cron.php','php'=>PHP_VERSION];
+    return ['base_url'=>cw_setting('base_url'),'alert_email'=>cw_setting('alert_email'),'mail_from'=>cw_setting('mail_from'),'email_browser'=>cw_setting('email_browser','0'),'retention'=>cw_setting('retention','90'),'hcaptcha_enabled'=>cw_setting('hcaptcha_enabled','0'),'hcaptcha_sitekey'=>cw_setting('hcaptcha_sitekey'),'hcaptcha_secret_saved'=>cw_setting('hcaptcha_secret')!==''?'1':'0','pagespeed_key_saved'=>cw_setting('pagespeed_api_key')!==''?'1':'0','cron_at'=>cw_setting('cron_at','0'),'mail_status'=>cw_setting('mail_status','Not configured'),'curl'=>extension_loaded('curl'),'version'=>CW_VERSION,'data_dir'=>cw_config()['data_dir'],'cron_file'=>dirname(__DIR__).'/cron.php','php'=>PHP_VERSION];
 }
 function cw_admin_api(string $action): never {
     cw_auth();
@@ -376,6 +492,18 @@ function cw_admin_api(string $action): never {
         session_write_close(); require_once __DIR__.'/monitor.php';
         cw_check_site($s); cw_json(['ok'=>true]);
     }
+    if ($action==='seo_check') {
+        $s=cw_site(cw_str($b['id'] ?? '',32));
+        if (!cw_rate('manual-seo:'.$s['id'],2,300)) cw_fail('Please wait a few minutes before another SEO / PageSpeed check.',429);
+        session_write_close(); require_once __DIR__.'/monitor.php';
+        $result=cw_seo_check_site($s,true); cw_json(['ok'=>true,'seo'=>$result]);
+    }
+    if ($action==='tracker_check') {
+        $s=cw_site(cw_str($b['id'] ?? '',32));
+        if (!cw_rate('manual-tracker:'.$s['id'],4,300)) cw_fail('Please wait a moment before another tracker diagnostic.',429);
+        session_write_close(); require_once __DIR__.'/monitor.php';
+        $result=cw_tracker_check_site($s); cw_json(['ok'=>true,'tracker'=>$result]);
+    }
     if ($action==='settings') {
         $base=cw_url($b['base_url'] ?? '');
         if (!str_ends_with((string)parse_url($base,PHP_URL_PATH),'/index.php')) cw_fail('Dashboard URL must end with /index.php.');
@@ -385,12 +513,13 @@ function cw_admin_api(string $action): never {
         $hcaptchaEnabled=!empty($b['hcaptcha_enabled']);
         $hcaptchaSitekey=cw_str($b['hcaptcha_sitekey'] ?? '',120);
         $hcaptchaSecret=cw_str($b['hcaptcha_secret'] ?? '',240);
+        $pagespeedKey=cw_str($b['pagespeed_api_key'] ?? '',240);
         if ($hcaptchaEnabled && ($hcaptchaSitekey==='' || ($hcaptchaSecret==='' && cw_setting('hcaptcha_secret')===''))) cw_fail('Enter both hCaptcha site key and secret before enabling login protection.');
         if (!empty($b['password'])) {
             if (!password_verify((string)($b['current_password'] ?? ''),cw_setting('password'))) cw_fail('Current password is incorrect.',403);
             if (strlen((string)$b['password'])<14 || strlen((string)$b['password'])>200) cw_fail('Use a password between 14 and 200 characters.');
         }
-        cw_setting_set('base_url',$base); cw_setting_set('alert_email',cw_str($b['alert_email'] ?? '',200)); cw_setting_set('mail_from',cw_str($b['mail_from'] ?? '',200)); cw_setting_set('email_browser',!empty($b['email_browser'])?'1':'0'); cw_setting_set('retention',(string)$retention); cw_setting_set('hcaptcha_enabled',$hcaptchaEnabled?'1':'0'); cw_setting_set('hcaptcha_sitekey',$hcaptchaSitekey); if ($hcaptchaSecret!=='') cw_setting_set('hcaptcha_secret',$hcaptchaSecret);
+        cw_setting_set('base_url',$base); cw_setting_set('alert_email',cw_str($b['alert_email'] ?? '',200)); cw_setting_set('mail_from',cw_str($b['mail_from'] ?? '',200)); cw_setting_set('email_browser',!empty($b['email_browser'])?'1':'0'); cw_setting_set('retention',(string)$retention); cw_setting_set('hcaptcha_enabled',$hcaptchaEnabled?'1':'0'); cw_setting_set('hcaptcha_sitekey',$hcaptchaSitekey); if ($hcaptchaSecret!=='') cw_setting_set('hcaptcha_secret',$hcaptchaSecret); if ($pagespeedKey!=='') cw_setting_set('pagespeed_api_key',$pagespeedKey);
         if (!empty($b['password'])) {
             cw_setting_set('password',password_hash($b['password'],PASSWORD_DEFAULT)); cw_setting_set('auth_version',bin2hex(random_bytes(16))); $_SESSION['auth_version']=cw_setting('auth_version'); session_regenerate_id(true);
         }

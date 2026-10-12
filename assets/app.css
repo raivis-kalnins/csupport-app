@@ -14,3 +14,18 @@ dialog{border:1px solid var(--line);padding:0;border-radius:15px;background:var(
 
 /* ClientWatch 1.1 */
 .h-captcha{min-height:78px;overflow:hidden}.detail-stat span{display:block;color:var(--muted);font-size:9px;margin-top:5px}.wp-health-stats{grid-template-columns:repeat(4,minmax(0,1fr));margin:18px 0}.wp-health-stats .detail-stat strong{font-size:24px}@media(max-width:620px){.wp-health-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* ClientWatch 1.2 additions */
+[hidden]{display:none!important}
+.status-badge.no-wp{background:var(--surface-2,#f3f4f6);color:var(--muted,#6b7280);border-color:var(--border,#e5e7eb)}
+.score-layout{display:grid;grid-template-columns:170px minmax(0,1fr);gap:16px;align-items:stretch}
+.score-card{display:flex;min-height:170px;flex-direction:column;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:16px;background:var(--surface);box-shadow:var(--shadow-sm)}
+.score-card strong{font-size:42px;line-height:1;font-weight:750;letter-spacing:-.04em}
+.score-card span{margin-top:9px;color:var(--muted);font-size:13px;font-weight:650}
+.score-card.good strong{color:var(--green,#12805c)}
+.score-card.warn strong{color:#a16207}
+.score-card.bad strong{color:#b42318}
+@media (max-width:720px){.score-layout{grid-template-columns:1fr}.score-card{min-height:120px}}
+.error-stack{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}.error-stack summary{cursor:pointer;font-weight:600}.error-stack pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:280px;overflow:auto;font-size:12px;line-height:1.5;margin:10px 0 0}
+
+.status-sub + .status-badge{margin-top:5px}.status-badge.no-wp{opacity:.72}.break-word{overflow-wrap:anywhere;word-break:break-word}

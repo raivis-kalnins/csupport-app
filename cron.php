@@ -10,6 +10,13 @@ try {
         try{$result=cw_check_site($site);echo $site['name'].': '.$result['status'].' ('.$result['code'].")\n";}catch(Throwable $e){fwrite(STDERR,$site['name'].": check failed. See PHP log.\n");error_log($e->getMessage());}
     }
     else fwrite(STDERR,"PHP cURL is missing. HTTP checks skipped.\n");
+    if(extension_loaded('curl'))foreach(cw_q('SELECT * FROM sites WHERE seo_checked_at<? ORDER BY seo_checked_at LIMIT 3',[time()-86400])->fetchAll() as $site){
+        try{$seo=cw_seo_check_site($site,false);echo $site['name'].': SEO '.$seo['score']."/100\n";}catch(Throwable $e){fwrite(STDERR,$site['name'].": SEO check failed. See PHP log.\n");error_log($e->getMessage());}
+    }
+    // Backfill dashboard-only technology/tracker diagnostics for sites audited before 1.2.4.
+    if(extension_loaded('curl'))foreach(cw_q("SELECT * FROM sites WHERE seo_report NOT LIKE '%\"technology\"%' ORDER BY seo_checked_at LIMIT 5")->fetchAll() as $site){
+        try{$tracker=cw_tracker_check_site($site);echo $site['name'].': diagnostics '.($tracker['status'] ?? 'unknown')."\n";}catch(Throwable $e){fwrite(STDERR,$site['name'].": diagnostics failed. See PHP log.\n");error_log($e->getMessage());}
+    }
     cw_cleanup();cw_send_alerts();flock($lock,LOCK_UN);fclose($lock);
     echo "Cleanup and notification processing complete.\n";
 } catch(Throwable $e){fwrite(STDERR,'ClientWatch cron: '.$e->getMessage()."\n");exit(1);}
